@@ -217,6 +217,75 @@ class IngestResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Read-only ingestion impact preview (POST /ingest/preview)
+# ---------------------------------------------------------------------------
+
+class SnapshotChange(BaseModel):
+    """One ``(source_id, MMSI)`` snapshot actually changed by a previewed batch.
+
+    Only pairs whose merged snapshot differs after the batch are listed;
+    ``before`` is null when the pair had no stored snapshot yet.
+    """
+
+    source_id: str
+    mmsi: int
+    before: Optional[VesselSnapshot] = Field(
+        None, description="Merged snapshot before the batch; null for a new pair."
+    )
+    after: VesselSnapshot = Field(
+        ..., description="Merged snapshot as it would be after the batch."
+    )
+
+
+class NewTrackPoint(BaseModel):
+    """One valid position track point the previewed batch would newly store.
+
+    Same-instant retransmissions, invalidated keys and other writes that do
+    not insert a fresh ``vessel_track`` row are not listed.
+    """
+
+    source_id: str
+    mmsi: int
+    point: TrackPoint
+
+
+class IngestPreview(BaseModel):
+    """Read-only impact preview of a batch: decode outcome plus actual changes.
+
+    The report lists only what the equivalent ``POST /ingest`` would change:
+    per-``(source_id, MMSI)`` snapshot before/after values, newly stored
+    valid track points and newly created same-instant source-pair conflicts.
+    Nothing is persisted: the dry run is rolled back in full.
+    """
+
+    observed_at: datetime
+    summary: Summary
+    results: list[DecodeResult]
+    snapshot_changes: list[SnapshotChange] = Field(
+        ...,
+        description=(
+            "Merged snapshot before/after for every (source_id, MMSI) pair "
+            "whose snapshot the batch would actually change."
+        ),
+    )
+    new_track_points: list[NewTrackPoint] = Field(
+        ...,
+        description=(
+            "Position reports (message 1/2/3) the batch would newly append "
+            "to vessel_track, including late (older) observations."
+        ),
+    )
+    new_position_conflicts: list[PositionConflict] = Field(
+        ...,
+        description=(
+            "Same-instant source-pair conflicts the batch would newly "
+            "create (an older position can backfill a historical conflict "
+            "without touching the latest snapshot)."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Persistent position tracks
 # ---------------------------------------------------------------------------
 
