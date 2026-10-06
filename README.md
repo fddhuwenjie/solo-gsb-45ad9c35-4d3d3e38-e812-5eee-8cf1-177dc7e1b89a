@@ -6,7 +6,9 @@
 `POST /ingest` 在此基础上携带本批 UTC 观测时间 `observed_at`，把成功解码的消息
 按 `(source_id, MMSI)` 持久化为可查询的船舶快照（SQLite），并提供 `GET /vessels` 查询；
 每条成功解码的船位（消息 1/2/3）还会追加到**可按时间回看的船位轨迹**，由 `GET /tracks`
-按 `observed_at` 升序回放。接收站发现已入库船位为误报时，`POST /tracks/invalidate`
+按 `observed_at` 升序回放。正式入库前可用 `POST /ingest/preview` 做**只读预演**：
+输入与 `/ingest` 相同，返回逐句解码结果与**只列实际变化**的入库影响（快照前后值、
+新增有效轨迹点、新增同刻来源对冲突），预演本身不写任何数据。接收站发现已入库船位为误报时，`POST /tracks/invalidate`
 按 `(source_id, MMSI, observed_at)` 把该轨迹点**标为无效**并记录原因：该点从轨迹中隐藏、
 `/vessels` 船位快照退至同源同船最新有效点，且此后任何同时间的船位写入都不能重新激活它。
 对无 `sequence_id` 的歧义批，`POST /reviews` 可建立**待核定批**（保存原批与各歧义池全部候选，
@@ -43,6 +45,14 @@
   - 整条消息原样保存：新船位坐标为 `null` 时保留 `null`，**不借用历史坐标**；
   - 错误、缺片与歧义候选**不写入**快照；歧义批仍返回 409，但其中明确解码的消息**仍更新**快照；
   - 本地 **SQLite** 持久化，Compose 重启后仍可查询。
+- **只读入库预演（`POST /ingest/preview`）**：
+  - 输入与 `/ingest` 相同，逐句解码结果与汇总、`200`/`409` 语义完全一致；
+  - 在同一事务内试写并**一律回滚**，成功或失败都不留写入；前后状态取自**同一次 SQLite 视图**；
+  - 响应 `changes` **只列实际变化**：按 `(source_id, MMSI)` 的快照前后值、**新增有效轨迹点**、
+    **新增同刻来源对冲突**——迟到旧船位不改变最新快照，因此不进 `snapshots`，但仍会列入
+    轨迹点并可能补出历史冲突；
+  - 预演遵循全部既有入库规则（同刻先存、迟到入轨、已作废点不复活、歧义批仅写明确消息）；
+    若期间没有其他写入，随后调用 `/ingest` 持久化的变更与预演**完全一致**。
 - **船位轨迹（`GET /tracks`）**：
   - `/ingest` 成功解码的船位（消息 1/2/3）按原语句下标逐点写入，**迟到的旧观测仍保留在轨迹中**
     （只是不回滚 `/vessels` 最新快照），可按 `observed_at` 升序完整回看；
@@ -107,7 +117,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 124 个单元/集成测试
+pytest -q          # 139 个单元/集成测试
 ```
 
 ## API
@@ -176,6 +186,83 @@ HTTP 状态码：
 | null 坐标 | 新船位坐标为 `null` 时保留 `null`，不借用历史坐标（快照与轨迹点均如此） |
 | 不写入 | 错误、缺片、歧义候选不写入快照（也不生成轨迹点） |
 | 轨迹 | 每条船位另按 `(source_id, MMSI, observed_at)` 追加到 `vessel_track`，迟到旧点保留、同时间去重，详见 `GET /tracks` |
+
+### `POST /ingest/preview`（只读入库预演）
+
+请求体与 `/ingest` 完全相同（`observed_at` + `sentences`）。服务按同一套校验、去重、
+重组、解码处理，并在**单个事务**内试写后**一律回滚**——预演成功或失败都不留下任何写入；
+前后状态取自**同一次 SQLite 视图**。响应在 `observed_at` / `summary` / `results` 之外
+增加 `changes`，**只列实际变化**——即同一请求直接调 `/ingest` 会持久化的内容：
+
+- `changes.snapshots`：会发生变化的 `(source_id, MMSI)` 快照的**前后值**
+  （`before` 为 `null` 表示该船尚无已存状态）；
+- `changes.track_points`：会**新增的有效轨迹点**（含迟到旧观测——它不回滚最新快照，
+  因此不进 `snapshots`，但仍列在这里）；
+- `changes.conflicts`：会**新增的同刻来源对冲突**（迟到船位可能只补出历史冲突）。
+
+HTTP 状态码语义与 `/ingest` 一致：`200` 正常，`409` 存在歧义分组（`changes` 只含其中
+**明确解码**消息的影响），`422` 请求体不合法。预演遵循全部既有入库规则（同刻先存者
+优先、迟到点入轨、已作废点不复活、歧义批仅写入明确消息）；若预演与正式入库之间没有
+其他写入，随后的 `/ingest` 持久化的变更与预演**完全一致**。
+
+```bash
+# 1) 预演：只读，不写库
+curl -s -X POST http://localhost:8000/ingest/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"observed_at":"2026-10-05T12:00:00Z",
+       "sentences":[{"source_id":"ais-receiver-1",
+                     "sentence":"!AIVDM,1,1,,A,15Mwqgh01DreE9HGD@44gkg40000,0*1C"}]}'
+```
+
+响应 `200`（节选）——`changes` 预告该批将新建快照与 1 个轨迹点：
+
+```json
+{
+  "observed_at": "2026-10-05T12:00:00Z",
+  "summary": { "total_sentences": 1, "decoded": 1 },
+  "changes": {
+    "snapshots": [
+      {
+        "source_id": "ais-receiver-1",
+        "mmsi": 366999999,
+        "before": null,
+        "after": {
+          "source_id": "ais-receiver-1",
+          "mmsi": 366999999,
+          "position": {
+            "observed_at": "2026-10-05T12:00:00Z",
+            "data": { "message_type": 1, "longitude": -73.9835, "latitude": 40.7484, "...": "..." }
+          },
+          "static": null
+        }
+      }
+    ],
+    "track_points": [
+      { "source_id": "ais-receiver-1", "mmsi": 366999999,
+        "observed_at": "2026-10-05T12:00:00Z",
+        "data": { "message_type": 1, "longitude": -73.9835, "latitude": 40.7484, "...": "..." } }
+    ],
+    "conflicts": []
+  }
+}
+```
+
+```bash
+# 2) 确认无误后正式入库：持久化的变更与预演一致
+curl -s -X POST http://localhost:8000/ingest \
+  -H 'Content-Type: application/json' \
+  -d '{"observed_at":"2026-10-05T12:00:00Z",
+       "sentences":[{"source_id":"ais-receiver-1",
+                     "sentence":"!AIVDM,1,1,,A,15Mwqgh01DreE9HGD@44gkg40000,0*1C"}]}'
+
+# 3) 入库后再预演同一批：已无任何变化
+curl -s -X POST http://localhost:8000/ingest/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"observed_at":"2026-10-05T12:00:00Z",
+       "sentences":[{"source_id":"ais-receiver-1",
+                     "sentence":"!AIVDM,1,1,,A,15Mwqgh01DreE9HGD@44gkg40000,0*1C"}]}'
+# -> "changes": {"snapshots": [], "track_points": [], "conflicts": []}
+```
 
 ### `GET /vessels`
 
@@ -829,20 +916,25 @@ curl -s 'http://localhost:8000/vessels?source_id=ais-receiver-1&mmsi=366999999'
   判定直接基于**轨迹中未作废且经纬度齐全**的点，与 `/vessels` 最新快照无关，因此迟到核定
   即使不回滚快照也会补齐历史冲突。打开旧库时在迁移事务内由现存轨迹（含旧快照回填的唯一起点）
   整表重建，升级后即可查出冲突，且重复打开结果不变。
+- **只读预演**：`/ingest/preview` 复用与 `/ingest` 完全相同的解码与 `_write_message` /
+  冲突重算路径，在 `BEGIN IMMEDIATE` 开启的**单个事务**内试写，前后状态（涉及船舶的快照、
+  有效轨迹点、涉及 `(mmsi, observed_at)` 组的冲突）均读自这同一次 SQLite 视图，比较后
+  **一律 `ROLLBACK`**——成功或失败都不留写入。由于试写路径与正式入库逐行一致，预演期间
+  又无其他写入（存储锁保证），随后的 `/ingest` 会持久化与预演完全一致的变更。
 
 ## 项目结构
 
 ```
 app/
-  main.py        # FastAPI 入口，POST /decode、/ingest、/tracks/invalidate、/reviews、GET /vessels、/tracks、/position-conflicts、/reviews、/health
-  models.py      # Pydantic 请求/响应模型（含快照、船位轨迹、误报标记、船位冲突与核定批模型）
+  main.py        # FastAPI 入口，POST /decode、/ingest、/ingest/preview、/tracks/invalidate、/reviews、GET /vessels、/tracks、/position-conflicts、/reviews、/health
+  models.py      # Pydantic 请求/响应模型（含快照、预演变更、船位轨迹、误报标记、船位冲突与核定批模型）
   nmea.py        # NMEA 0183 语句解析与校验（XOR 校验和、分片、fill bits）
   ais.py         # 六位 armour、位提取、消息 1/2/3 与 5 解码
   assembler.py   # 归组、乱序重组、孤儿分片池歧义枚举
-  storage.py     # SQLite 快照、船位轨迹（含旧库起点回填）、误报标记、船位冲突清单与核定批持久化（单事务）
+  storage.py     # SQLite 快照、船位轨迹（含旧库起点回填）、误报标记、船位冲突清单、核定批持久化（单事务）与只读入库预演（试写后回滚）
 scripts/
   generate_examples.py  # 重新生成 README/测试中的示例报文
-tests/           # pytest 单元与 API 集成测试（含快照、轨迹时序语义、误报标记、船位冲突与人工核定流程）
+tests/           # pytest 单元与 API 集成测试（含快照、预演、轨迹时序语义、误报标记、船位冲突与人工核定流程）
 Dockerfile
 docker-compose.yml      # 命名卷 ais-data 持久化 /data/ais.db
 requirements.txt / requirements-dev.txt

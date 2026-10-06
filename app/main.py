@@ -20,6 +20,7 @@ from .models import (
     DecodeRequest,
     DecodeResponse,
     DecodeResult,
+    IngestPreviewResponse,
     IngestRequest,
     IngestResponse,
     InvalidateRequest,
@@ -62,6 +63,11 @@ app = FastAPI(
         "of the latest position and static/voyage messages and an append-only "
         "position track (every stored type 1/2/3 report, including late "
         "observations), queryable via GET /vessels and GET /tracks. "
+        "POST /ingest/preview is its read-only dry run: same input, same "
+        "200/409 semantics, reporting only the actual changes (snapshot "
+        "before/after values, new valid track points, new same-instant "
+        "source-pair conflicts) an identical /ingest would persist, "
+        "without writing anything. "
         "A stored track point that turns out to be a misreport can be "
         "marked invalid via POST /tracks/invalidate: it disappears from "
         "GET /tracks, the position snapshot falls back to the latest "
@@ -248,6 +254,60 @@ def ingest(request: IngestRequest):
         summary=decoded.summary,
         results=decoded.results,
         snapshots=snapshots,
+    )
+    if any(r.status == "ambiguous" for r in response.results):
+        return JSONResponse(status_code=409, content=jsonable_encoder(response))
+    return response
+
+
+@app.post(
+    "/ingest/preview",
+    response_model=IngestPreviewResponse,
+    responses={
+        200: {
+            "description": (
+                "Dry run completed; no ambiguous group. Nothing was written."
+            )
+        },
+        409: {
+            "model": IngestPreviewResponse,
+            "description": (
+                "At least one ambiguous fragment pool; the reported changes "
+                "cover only the unambiguous decodes, exactly as /ingest "
+                "would persist them. Nothing was written."
+            ),
+        },
+    },
+    tags=["snapshots"],
+    description=(
+        "Read-only dry run of POST /ingest for the same request body "
+        "(``sentences`` + ``observed_at``). The batch is validated, "
+        "assembled and decoded exactly as /ingest, and the store writes are "
+        "applied inside one transaction that is always rolled back, so the "
+        "preview persists nothing whether it succeeds or fails. The "
+        "response lists only the actual changes an identical /ingest call "
+        "would persist under the current rules (same-instant first-saved "
+        "wins, late points enter the track, invalidated points are never "
+        "re-activated, ambiguous batches write only their unambiguous "
+        "decodes): per-(source_id, MMSI) snapshot before/after values, "
+        "newly added valid track points and new same-instant source-pair "
+        "conflicts — a late position report may backfill historical "
+        "conflicts without changing the latest snapshot. Before/after "
+        "states are read from the same SQLite view; with no other write in "
+        "between, a following /ingest persists exactly the reported "
+        "changes. Same 200/409 semantics as /ingest."
+    ),
+)
+def preview_ingest(request: IngestRequest):
+    decoded = _build_response(request.sentences)
+    observed_at = normalize_observed_at(request.observed_at)
+    writes = _collect_writes(decoded.results, observed_at)
+    changes = get_store().preview_ingest(writes)
+    response = IngestPreviewResponse(
+        observed_at=request.observed_at,
+        summary=decoded.summary,
+        results=decoded.results,
+        changes=changes,
     )
     if any(r.status == "ambiguous" for r in response.results):
         return JSONResponse(status_code=409, content=jsonable_encoder(response))

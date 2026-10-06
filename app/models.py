@@ -217,6 +217,60 @@ class IngestResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Read-only ingest preview
+# ---------------------------------------------------------------------------
+
+class SnapshotChange(BaseModel):
+    """Before/after values of one (source_id, MMSI) snapshot that would change.
+
+    ``before`` is null when the vessel has no stored state yet; ``after``
+    is the merged snapshot as an identical ``POST /ingest`` would store it.
+    """
+
+    source_id: str
+    mmsi: int
+    before: Optional[VesselSnapshot] = Field(
+        None, description="Stored snapshot before the batch; null when none exists.")
+    after: VesselSnapshot = Field(
+        ..., description="Snapshot as the identical /ingest call would store it.")
+
+
+class PreviewTrackPoint(BaseModel):
+    """One valid track point an identical ``POST /ingest`` would add."""
+
+    source_id: str
+    mmsi: int
+    observed_at: datetime = Field(
+        ..., description="UTC observation time the point would be stored under.")
+    data: PositionReport
+
+
+class IngestChanges(BaseModel):
+    """The actual changes an identical ``POST /ingest`` call would persist.
+
+    Only real differences are listed: a late (older) position report that
+    never rolls back the latest snapshot still appears under
+    ``track_points`` and may add historical ``conflicts``.
+    """
+
+    snapshots: list[SnapshotChange] = Field(
+        ..., description="Per-(source_id, MMSI) snapshots that would change.")
+    track_points: list[PreviewTrackPoint] = Field(
+        ..., description="Valid track points that would be newly stored.")
+    conflicts: list[PositionConflict] = Field(
+        ..., description="Same-instant source-pair conflicts that would be newly recorded.")
+
+
+class IngestPreviewResponse(BaseModel):
+    """Dry-run outcome: decode results plus the changes ``/ingest`` would persist."""
+
+    observed_at: datetime
+    summary: Summary
+    results: list[DecodeResult]
+    changes: IngestChanges
+
+
+# ---------------------------------------------------------------------------
 # Persistent position tracks
 # ---------------------------------------------------------------------------
 

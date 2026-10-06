@@ -61,6 +61,12 @@ batch of sentences. The original sentences and the full decode outcome
 pending batches, their candidates and the resolution (chosen candidates plus
 the snapshots actually stored) survive restarts. Resolution applies the
 snapshot and track writes and flips the status in a single transaction.
+
+:meth:`SnapshotStore.preview_ingest` is the read-only counterpart of
+:meth:`SnapshotStore.apply_ingest`: it applies the same writes in one
+transaction, diffs the before/after state read from that single SQLite view
+(changed snapshots, new valid track points, new source-pair conflicts) and
+always rolls the transaction back, so a preview never persists anything.
 """
 from __future__ import annotations
 
@@ -72,9 +78,12 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .models import (
+    IngestChanges,
     PositionConflict,
     PositionConflictPoint,
     PositionReport,
+    PreviewTrackPoint,
+    SnapshotChange,
     StaticAndVoyageData,
     TimedPositionReport,
     TimedStaticAndVoyageData,
@@ -432,6 +441,95 @@ class SnapshotStore:
             self._refresh_conflicts(affected)
             return sorted({(w[0], w[1]) for w in writes})
 
+    def preview_ingest(
+        self,
+        writes: list[tuple[str, int, str, str, dict, int]],
+    ) -> IngestChanges:
+        """Read-only dry run of :meth:`apply_ingest`: report, never persist.
+
+        *writes* are applied inside a single transaction exactly as a real
+        ingest would apply them (same first-saved-wins, late-point,
+        invalidated-point and conflict-refresh rules); the before/after
+        states are read from this one SQLite view and the transaction is
+        always rolled back, so a preview leaves no writes behind whether
+        it succeeds or fails. With no other write in between, a following
+        ``/ingest`` of the same batch persists exactly the reported
+        changes. Only actual differences are reported: a late (older)
+        position report that never rolls back the latest snapshot still
+        appears as a new track point and may backfill historical
+        conflicts.
+        """
+        involved = sorted({(w[0], w[1]) for w in writes})
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                before_snapshots = {
+                    key: self._snapshot_or_none(*key) for key in involved
+                }
+                before_points = {
+                    key: {
+                        point.observed_at
+                        for point in self._fetch_track_points(*key)
+                    }
+                    for key in involved
+                }
+                # Every position write of the batch may change the
+                # conflicts of its (mmsi, observed_at) group — even one
+                # that is later skipped. Pre-seeding the set _write_message
+                # fills yields exactly the groups apply_ingest refreshes.
+                affected: set[tuple[int, str]] = {
+                    (w[1], w[3]) for w in writes if w[2] == KIND_POSITION
+                }
+                before_conflicts = {
+                    self._conflict_key(conflict)
+                    for conflict in self._fetch_conflicts_for_groups(affected)
+                }
+                for source_id, mmsi, kind, observed_at, data, sentence_index in writes:
+                    self._write_message(
+                        source_id, mmsi, kind, observed_at, data,
+                        sentence_index, affected=affected,
+                    )
+                self._refresh_conflicts(affected)
+
+                snapshot_changes: list[SnapshotChange] = []
+                track_points: list[PreviewTrackPoint] = []
+                for source_id, mmsi in involved:
+                    before = before_snapshots[(source_id, mmsi)]
+                    after = self._snapshot_or_none(source_id, mmsi)
+                    if before != after:
+                        assert after is not None  # ingest never removes state
+                        snapshot_changes.append(
+                            SnapshotChange(
+                                source_id=source_id,
+                                mmsi=mmsi,
+                                before=before,
+                                after=after,
+                            )
+                        )
+                    known = before_points[(source_id, mmsi)]
+                    for point in self._fetch_track_points(source_id, mmsi):
+                        if point.observed_at not in known:
+                            track_points.append(
+                                PreviewTrackPoint(
+                                    source_id=source_id,
+                                    mmsi=mmsi,
+                                    observed_at=point.observed_at,
+                                    data=point.data,
+                                )
+                            )
+                conflicts = [
+                    conflict
+                    for conflict in self._fetch_conflicts_for_groups(affected)
+                    if self._conflict_key(conflict) not in before_conflicts
+                ]
+                return IngestChanges(
+                    snapshots=snapshot_changes,
+                    track_points=track_points,
+                    conflicts=conflicts,
+                )
+            finally:
+                self._conn.rollback()
+
     # -- reads ----------------------------------------------------------------
 
     def _fetch_rows(
@@ -480,11 +578,18 @@ class SnapshotStore:
                 )
         return snapshot
 
-    def get_snapshot(self, source_id: str, mmsi: int) -> Optional[VesselSnapshot]:
-        rows = self._rows(source_id=source_id, mmsi=mmsi)
+    def _snapshot_or_none(
+        self, source_id: str, mmsi: int
+    ) -> Optional[VesselSnapshot]:
+        """Merged snapshot of one vessel; caller must hold the lock."""
+        rows = self._fetch_rows(source_id, mmsi)
         if not rows:
             return None
         return self._to_snapshot(source_id, mmsi, rows)
+
+    def get_snapshot(self, source_id: str, mmsi: int) -> Optional[VesselSnapshot]:
+        with self._lock:
+            return self._snapshot_or_none(source_id, mmsi)
 
     def list_snapshots(
         self,
@@ -516,22 +621,19 @@ class SnapshotStore:
             ).fetchone()
             return row is not None
 
-    def get_track(self, source_id: str, mmsi: int) -> list[TrackPoint]:
-        """All valid stored position reports for one vessel, oldest first.
+    def _fetch_track_points(self, source_id: str, mmsi: int) -> list[TrackPoint]:
+        """Valid track points of one vessel, oldest first.
 
-        Ordered by ``observed_at`` (then original sentence index); points
-        are stored as decoded, including null coordinates. Points marked
-        invalid (misreports) are not returned.
+        Caller must hold the lock.
         """
-        with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT observed_at, data FROM vessel_track
-                WHERE source_id = ? AND mmsi = ? AND valid = 1
-                ORDER BY observed_at, sentence_index
-                """,
-                (source_id, mmsi),
-            ).fetchall()
+        rows = self._conn.execute(
+            """
+            SELECT observed_at, data FROM vessel_track
+            WHERE source_id = ? AND mmsi = ? AND valid = 1
+            ORDER BY observed_at, sentence_index
+            """,
+            (source_id, mmsi),
+        ).fetchall()
         return [
             TrackPoint(
                 observed_at=_parse_observed_at(row["observed_at"]),
@@ -540,7 +642,62 @@ class SnapshotStore:
             for row in rows
         ]
 
+    def get_track(self, source_id: str, mmsi: int) -> list[TrackPoint]:
+        """All valid stored position reports for one vessel, oldest first.
+
+        Ordered by ``observed_at`` (then original sentence index); points
+        are stored as decoded, including null coordinates. Points marked
+        invalid (misreports) are not returned.
+        """
+        with self._lock:
+            return self._fetch_track_points(source_id, mmsi)
+
     # -- position conflicts -----------------------------------------------------
+
+    @staticmethod
+    def _row_to_conflict(row: sqlite3.Row) -> PositionConflict:
+        return PositionConflict(
+            mmsi=row["mmsi"],
+            observed_at=_parse_observed_at(row["observed_at"]),
+            source_id_a=row["source_id_a"],
+            point_a=PositionConflictPoint(
+                longitude=row["longitude_a"], latitude=row["latitude_a"]
+            ),
+            source_id_b=row["source_id_b"],
+            point_b=PositionConflictPoint(
+                longitude=row["longitude_b"], latitude=row["latitude_b"]
+            ),
+            distance_m=round(row["distance_m"], 3),
+        )
+
+    @staticmethod
+    def _conflict_key(conflict: PositionConflict) -> tuple:
+        return (
+            conflict.mmsi,
+            conflict.observed_at,
+            conflict.source_id_a,
+            conflict.source_id_b,
+        )
+
+    def _fetch_conflicts_for_groups(
+        self, groups: set[tuple[int, str]]
+    ) -> list[PositionConflict]:
+        """Stored conflicts of the given ``(mmsi, observed_at)`` groups.
+
+        Caller must hold the lock.
+        """
+        conflicts: list[PositionConflict] = []
+        for mmsi, observed_at in sorted(groups):
+            rows = self._conn.execute(
+                """
+                SELECT * FROM position_conflict
+                WHERE mmsi = ? AND observed_at = ?
+                ORDER BY mmsi, observed_at, source_id_a, source_id_b
+                """,
+                (mmsi, observed_at),
+            ).fetchall()
+            conflicts.extend(self._row_to_conflict(row) for row in rows)
+        return conflicts
 
     def list_position_conflicts(
         self,
@@ -573,22 +730,7 @@ class SnapshotStore:
         )
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()
-        return [
-            PositionConflict(
-                mmsi=row["mmsi"],
-                observed_at=_parse_observed_at(row["observed_at"]),
-                source_id_a=row["source_id_a"],
-                point_a=PositionConflictPoint(
-                    longitude=row["longitude_a"], latitude=row["latitude_a"]
-                ),
-                source_id_b=row["source_id_b"],
-                point_b=PositionConflictPoint(
-                    longitude=row["longitude_b"], latitude=row["latitude_b"]
-                ),
-                distance_m=round(row["distance_m"], 3),
-            )
-            for row in rows
-        ]
+        return [self._row_to_conflict(row) for row in rows]
 
     # -- track point invalidation ----------------------------------------------
 
